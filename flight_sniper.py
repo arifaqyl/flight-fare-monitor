@@ -1,75 +1,70 @@
-import os
 import requests
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from fast_flights import FlightData, Passengers, get_flights
 
-# Configuration
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-ROUTE_FROM = os.getenv("ROUTE_FROM", "KUL")
-ROUTE_TO = os.getenv("ROUTE_TO", "NRT")
-TARGET_PRICE = float(os.getenv("TARGET_PRICE", "1500.00")) # Threshold in MYR/local currency
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL", "3600")) # Default 1 hour
+# --- 🎯 CONFIG 🎯 ---
+TOKEN = "8326380455:AAGamuS5Ys3_TTrxUCeXiLDd745BWG0jw-U" # Keep this secret next time, Boss!
+DREAM_PRICE = 800  # Will alert for anything RM 800 and below
 
-def send_telegram_alert(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[{datetime.now()}] Telegram alert simulated (token/chat ID not configured):")
-        print(message)
-        return
-        
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+def get_chat_id():
+    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
     try:
-        response = requests.post(url, json=payload)
-        if response.status_code == 200:
-            print(f"[{datetime.now()}] Telegram alert sent successfully.")
-        else:
-            print(f"[{datetime.now()}] Failed to send Telegram alert: {response.text}")
+        res = requests.get(url).json()
+        # Takes the ID of the last person who messaged the bot
+        return res['result'][-1]['message']['chat']['id']
     except Exception as e:
-        print(f"[{datetime.now()}] Error sending Telegram alert: {e}")
+        return None
 
-def check_flights():
-    print(f"[{datetime.now()}] Fetching live flight prices for {ROUTE_FROM} -> {ROUTE_TO}...")
-    
-    # Simple flight price simulator representing a flight check daemon
-    import random
-    mock_price = round(random.uniform(1200.00, 1800.00), 2)
-    print(f"[{datetime.now()}] Lowest fare found: MYR {mock_price}")
-    
-    if mock_price <= TARGET_PRICE:
-        message = (
-            f"✈️ *Flight Price Drop Alert!*\n\n"
-            f"Route: `{ROUTE_FROM} ➔ {ROUTE_TO}`\n"
-            f"Target Price: `MYR {TARGET_PRICE}`\n"
-            f"Current Fare: *MYR {mock_price}*\n\n"
-            f"🔥 Quick! Grab the deal before prices change."
-        )
-        send_telegram_alert(message)
-    else:
-        print(f"[{datetime.now()}] Current price is above threshold (MYR {TARGET_PRICE}).")
+def send_tg(chat_id, msg):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": chat_id, "text": msg})
 
-def main():
-    print("=" * 60)
-    print("FLIGHT SNIPER - Flight Price Monitor & Telegram Bot")
-    print(f"Monitoring: {ROUTE_FROM} ➔ {ROUTE_TO}")
-    print(f"Price Threshold: MYR {TARGET_PRICE}")
-    print(f"Interval: {CHECK_INTERVAL_SECONDS}s")
-    print("=" * 60)
-    
-    # First check run
-    check_flights()
-    
-    # Scheduling loop
-    try:
-        while True:
-            time.sleep(CHECK_INTERVAL_SECONDS)
-            check_flights()
-    except KeyboardInterrupt:
-        print("\nFlight Sniper daemon stopped.")
+def scan_november(chat_id):
+    # Scanning Nov 1 to Nov 30, 2026
+    dates = [(datetime(2026, 11, 1) + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(30)]
+    print(f"\n📡 {datetime.now().strftime('%H:%M')} | Starting Mega-Scan for Nov 2026 (KUL -> KMG)...")
+
+    for d in dates:
+        print(f"🔍 Probing {d}...", end="\r")
+        try:
+            # Checking direct flights to Kunming
+            res = get_flights(
+                flight_data=[FlightData(date=d, from_airport="KUL", to_airport="KMG")],
+                trip="one-way",
+                fetch_mode="web"
+            )
+
+            for f in res.flights:
+                if f.stops == 0: # DIRECT ONLY
+                    # Extract numbers from price (e.g., 'MYR 1,200' -> 1200)
+                    price = int(''.join(filter(str.isdigit, f.price)))
+
+                    if price <= DREAM_PRICE:
+                        alert = (f"🚨 TARGET HIT! RM {price} DIRECT TO KUNMING! 🚨\n"
+                                f"📅 Date: {d}\n"
+                                f"✈️ Airline: {f.name}\n"
+                                f"⏱️ Duration: {f.duration}\n"
+                                f"🚀 AIRASIA MEGA SALE MIGHT BE LIVE. GO BOOK NOW!")
+                        send_tg(chat_id, alert)
+                        print(f"\n🎯 FOUND! {f.name} for RM {price} on {d}")
+
+            time.sleep(8) # Stealth delay to avoid Google blocks
+
+        except Exception:
+            continue # Skip errors (like Google blocking one date) and keep moving
 
 if __name__ == "__main__":
-    main()
+    print("🚀 Initializing Operation Yunnan Sniper...")
+    # 1. Wait for User to message the bot
+    cid = get_chat_id()
+    if not cid:
+        print("❌ FAILED: I can't see you! Go to Telegram, search your bot and send it a message first.")
+    else:
+        print(f"✅ Connection Established! ID: {cid}")
+        send_tg(cid, "🚀 Sniper Active! I am now watching ALL of November 2026 for your RM 800 Kunming ticket.")
+
+        while True:
+            scan_november(cid)
+            print("\n😴 Nov Scan Complete. Resting for 3 hours to stay stealthy...")
+            time.sleep(10800) # 3 hour nap so Google doesn't IP ban you
