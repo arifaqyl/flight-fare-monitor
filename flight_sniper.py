@@ -1,70 +1,326 @@
-import requests
+"""
+flight-sniper v2
+Monitors flight prices for configured routes, stores history in SQLite,
+sends Telegram alerts when price hits threshold or drops to a new low.
+Supports on-demand /check and /history bot commands.
+"""
+
+import os
+import sys
 import time
+import sqlite3
+import logging
 from datetime import datetime, timedelta
-from fast_flights import FlightData, Passengers, get_flights
 
-# --- 🎯 CONFIG 🎯 ---
-TOKEN = "8326380455:AAGamuS5Ys3_TTrxUCeXiLDd745BWG0jw-U" # Keep this secret next time, Boss!
-DREAM_PRICE = 800  # Will alert for anything RM 800 and below
+import requests
+from fast_flights import FlightData, get_flights
 
-def get_chat_id():
-    url = f"https://api.telegram.org/bot{TOKEN}/getUpdates"
+# ── CONFIG ───────────────────────────────────────────────────────────────────
+# Set BOT_TOKEN and CHAT_ID as environment variables, or paste directly here.
+BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "8326380455:AAGamuS5Ys3_TTrxUCeXiLDd745BWG0jw-U")
+CHAT_ID    = os.getenv("TG_CHAT_ID", "")        # filled on first run from getUpdates
+
+ROUTES = [
+    {
+        "label":     "KUL → KMG (Yunnan)",
+        "from":      "KUL",
+        "to":        "KMG",
+        "months":    [(2026, 11)],               # (year, month) pairs to scan
+        "threshold": 800,                        # RM — alert when price <= this
+        "direct":    True,                       # direct flights only
+    },
+    # Add more routes below:
+    # {
+    #     "label":     "KUL → SIN",
+    #     "from":      "KUL",
+    #     "to":        "SIN",
+    #     "months":    [(2026, 12)],
+    #     "threshold": 300,
+    #     "direct":    False,
+    # },
+]
+
+DB_PATH        = "price_history.db"
+POLL_INTERVAL  = 3 * 3600    # 3 hours between full scans
+REQUEST_DELAY  = 8           # seconds between individual date requests
+MAX_RETRIES    = 3
+RETRY_BACKOFF  = 30          # seconds before retry on failure
+
+# ── LOGGING ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("sniper.log"),
+    ]
+)
+log = logging.getLogger("sniper")
+
+# ── DATABASE ─────────────────────────────────────────────────────────────────
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS prices (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            route     TEXT    NOT NULL,
+            date      TEXT    NOT NULL,
+            airline   TEXT,
+            price     INTEGER NOT NULL,
+            duration  TEXT,
+            stops     INTEGER DEFAULT 0,
+            scanned   TEXT    DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def record_price(conn, route_label, date, airline, price, duration, stops):
+    conn.execute(
+        "INSERT INTO prices (route, date, airline, price, duration, stops) VALUES (?,?,?,?,?,?)",
+        (route_label, date, airline, price, duration, stops)
+    )
+    conn.commit()
+
+
+def get_lowest_ever(conn, route_label, date=None):
+    if date:
+        row = conn.execute(
+            "SELECT MIN(price) FROM prices WHERE route=? AND date=?",
+            (route_label, date)
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT MIN(price) FROM prices WHERE route=?", (route_label,)
+        ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def get_price_history(conn, route_label, limit=14):
+    rows = conn.execute(
+        "SELECT date, airline, price, scanned FROM prices WHERE route=? ORDER BY scanned DESC LIMIT ?",
+        (route_label, limit)
+    ).fetchall()
+    return rows
+
+# ── TELEGRAM ─────────────────────────────────────────────────────────────────
+def tg_send(chat_id, text):
     try:
-        res = requests.get(url).json()
-        # Takes the ID of the last person who messaged the bot
-        return res['result'][-1]['message']['chat']['id']
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
+        return r.ok
     except Exception as e:
-        return None
+        log.warning(f"Telegram send failed: {e}")
+        return False
 
-def send_tg(chat_id, msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": msg})
 
-def scan_november(chat_id):
-    # Scanning Nov 1 to Nov 30, 2026
-    dates = [(datetime(2026, 11, 1) + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(30)]
-    print(f"\n📡 {datetime.now().strftime('%H:%M')} | Starting Mega-Scan for Nov 2026 (KUL -> KMG)...")
+def tg_get_updates(offset=None):
+    try:
+        params = {"timeout": 30, "allowed_updates": ["message"]}
+        if offset:
+            params["offset"] = offset
+        r = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+            params=params, timeout=35
+        )
+        return r.json().get("result", [])
+    except Exception:
+        return []
 
-    for d in dates:
-        print(f"🔍 Probing {d}...", end="\r")
+
+def resolve_chat_id():
+    """Wait for the user to message the bot, return their chat ID."""
+    log.info("Waiting for you to message the bot on Telegram...")
+    while True:
+        updates = tg_get_updates()
+        if updates:
+            cid = updates[-1]["message"]["chat"]["id"]
+            log.info(f"Chat ID found: {cid}")
+            return str(cid)
+        time.sleep(3)
+
+# ── FETCH PRICES ─────────────────────────────────────────────────────────────
+def fetch_prices(from_airport, to_airport, date_str, direct_only=True):
+    """Fetch flight prices for a single date. Returns list of dicts."""
+    for attempt in range(MAX_RETRIES):
         try:
-            # Checking direct flights to Kunming
             res = get_flights(
-                flight_data=[FlightData(date=d, from_airport="KUL", to_airport="KMG")],
+                flight_data=[FlightData(date=date_str,
+                                        from_airport=from_airport,
+                                        to_airport=to_airport)],
                 trip="one-way",
                 fetch_mode="web"
             )
-
+            results = []
             for f in res.flights:
-                if f.stops == 0: # DIRECT ONLY
-                    # Extract numbers from price (e.g., 'MYR 1,200' -> 1200)
+                if direct_only and f.stops != 0:
+                    continue
+                try:
                     price = int(''.join(filter(str.isdigit, f.price)))
+                except (ValueError, AttributeError):
+                    continue
+                results.append({
+                    "airline":  f.name,
+                    "price":    price,
+                    "duration": getattr(f, "duration", ""),
+                    "stops":    f.stops,
+                })
+            return results
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                log.warning(f"Fetch failed ({e}), retrying in {RETRY_BACKOFF}s...")
+                time.sleep(RETRY_BACKOFF)
+            else:
+                log.error(f"All retries failed for {from_airport}→{to_airport} {date_str}: {e}")
+                return []
 
-                    if price <= DREAM_PRICE:
-                        alert = (f"🚨 TARGET HIT! RM {price} DIRECT TO KUNMING! 🚨\n"
-                                f"📅 Date: {d}\n"
-                                f"✈️ Airline: {f.name}\n"
-                                f"⏱️ Duration: {f.duration}\n"
-                                f"🚀 AIRASIA MEGA SALE MIGHT BE LIVE. GO BOOK NOW!")
-                        send_tg(chat_id, alert)
-                        print(f"\n🎯 FOUND! {f.name} for RM {price} on {d}")
+# ── SCAN ─────────────────────────────────────────────────────────────────────
+def scan_route(conn, route, chat_id):
+    label     = route["label"]
+    fr        = route["from"]
+    to        = route["to"]
+    threshold = route["threshold"]
+    direct    = route["direct"]
+    months    = route["months"]
 
-            time.sleep(8) # Stealth delay to avoid Google blocks
+    dates = []
+    for year, month in months:
+        # Build all dates in the month
+        d = datetime(year, month, 1)
+        while d.month == month:
+            dates.append(d.strftime("%Y-%m-%d"))
+            d += timedelta(days=1)
 
-        except Exception:
-            continue # Skip errors (like Google blocking one date) and keep moving
+    log.info(f"Scanning {label} — {len(dates)} dates")
+
+    for date_str in dates:
+        results = fetch_prices(fr, to, date_str, direct_only=direct)
+
+        for r in results:
+            price = r["price"]
+            record_price(conn, label, date_str, r["airline"], price, r["duration"], r["stops"])
+
+            prev_low = get_lowest_ever(conn, label, date_str)
+            is_new_low = prev_low is None or price < prev_low
+
+            if price <= threshold:
+                stops_tag = "direct" if r["stops"] == 0 else f"{r['stops']} stop"
+                msg = (
+                    f"<b>TARGET HIT — {label}</b>\n"
+                    f"RM {price} · {r['airline']} · {stops_tag}\n"
+                    f"Date: {date_str}  |  Duration: {r['duration']}\n"
+                )
+                if is_new_low:
+                    msg += f"<b>NEW HISTORICAL LOW</b> (prev: RM {prev_low})\n"
+                msg += f"Book now before it goes up."
+                tg_send(chat_id, msg)
+                log.info(f"ALERT: {label} {date_str} RM {price}")
+
+            elif is_new_low and prev_low is not None and price < prev_low * 0.9:
+                tg_send(chat_id,
+                    f"{label}: new low RM {price} on {date_str} "
+                    f"(was RM {prev_low}) — still above threshold"
+                )
+
+        time.sleep(REQUEST_DELAY)
+
+# ── BOT COMMAND HANDLER ───────────────────────────────────────────────────────
+def handle_commands(conn, chat_id, last_update_id):
+    """Process any pending Telegram commands. Returns new offset."""
+    updates = tg_get_updates(offset=last_update_id + 1 if last_update_id else None)
+    for upd in updates:
+        last_update_id = upd["update_id"]
+        msg = upd.get("message", {})
+        text = msg.get("text", "").strip()
+
+        if text.startswith("/check"):
+            tg_send(chat_id, "Scanning now...")
+            for route in ROUTES:
+                scan_route(conn, route, chat_id)
+            tg_send(chat_id, "Scan complete.")
+
+        elif text.startswith("/history"):
+            parts = text.split(maxsplit=1)
+            route_label = parts[1] if len(parts) > 1 else ROUTES[0]["label"]
+            rows = get_price_history(conn, route_label)
+            if not rows:
+                tg_send(chat_id, f"No history for {route_label}")
+            else:
+                lines = [f"<b>Last {len(rows)} checks — {route_label}</b>"]
+                for date, airline, price, scanned in rows:
+                    lines.append(f"RM {price}  {date}  {airline}  ({scanned[:10]})")
+                tg_send(chat_id, "\n".join(lines))
+
+        elif text.startswith("/lowest"):
+            lines = ["<b>Historical lows per route</b>"]
+            for route in ROUTES:
+                low = get_lowest_ever(conn, route["label"])
+                lines.append(f"{route['label']}: RM {low if low else 'no data'}")
+            tg_send(chat_id, "\n".join(lines))
+
+        elif text.startswith("/routes"):
+            lines = ["<b>Watching</b>"]
+            for r in ROUTES:
+                months_str = ", ".join(f"{m[0]}-{m[1]:02d}" for m in r["months"])
+                lines.append(f"{r['label']} | threshold RM {r['threshold']} | {months_str}")
+            tg_send(chat_id, "\n".join(lines))
+
+        elif text.startswith("/help") or text.startswith("/start"):
+            tg_send(chat_id,
+                "<b>flight-sniper commands</b>\n"
+                "/check — scan all routes now\n"
+                "/history [route] — last 14 price records\n"
+                "/lowest — historical low per route\n"
+                "/routes — show configured routes\n"
+                "/help — this message"
+            )
+
+    return last_update_id
+
+# ── MAIN ─────────────────────────────────────────────────────────────────────
+def main():
+    conn = init_db()
+    log.info("flight-sniper v2 starting")
+
+    chat_id = CHAT_ID
+    if not chat_id:
+        chat_id = resolve_chat_id()
+
+    tg_send(chat_id,
+        "<b>flight-sniper v2 active</b>\n"
+        + "\n".join(
+            f"{r['label']} — alert at ≤ RM {r['threshold']}"
+            for r in ROUTES
+        )
+        + "\n\nSend /help for commands."
+    )
+
+    last_update_id = None
+
+    while True:
+        # Check for bot commands first
+        last_update_id = handle_commands(conn, chat_id, last_update_id)
+
+        # Run scheduled full scan
+        log.info("Starting scheduled scan...")
+        for route in ROUTES:
+            scan_route(conn, route, chat_id)
+
+        log.info(f"Scan complete. Sleeping {POLL_INTERVAL // 3600}h...")
+        tg_send(chat_id, f"Scan complete. Next check in {POLL_INTERVAL // 3600}h.")
+
+        # Sleep in 30s chunks so commands are handled during the sleep window
+        elapsed = 0
+        while elapsed < POLL_INTERVAL:
+            time.sleep(30)
+            elapsed += 30
+            last_update_id = handle_commands(conn, chat_id, last_update_id)
+
 
 if __name__ == "__main__":
-    print("🚀 Initializing Operation Yunnan Sniper...")
-    # 1. Wait for User to message the bot
-    cid = get_chat_id()
-    if not cid:
-        print("❌ FAILED: I can't see you! Go to Telegram, search your bot and send it a message first.")
-    else:
-        print(f"✅ Connection Established! ID: {cid}")
-        send_tg(cid, "🚀 Sniper Active! I am now watching ALL of November 2026 for your RM 800 Kunming ticket.")
-
-        while True:
-            scan_november(cid)
-            print("\n😴 Nov Scan Complete. Resting for 3 hours to stay stealthy...")
-            time.sleep(10800) # 3 hour nap so Google doesn't IP ban you
+    main()
