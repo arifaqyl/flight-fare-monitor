@@ -1,40 +1,86 @@
-# Flight Sniper ✈️🎯
+# flight-sniper
 
-A automated flight price tracking daemon written in Python that monitors direct flights from Kuala Lumpur (KUL) to Kunming (KMG) for November 2026 and delivers instant price alerts directly to a Telegram channel/chat when prices drop to RM 800 or below.
+![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-alert-2CA5E0?style=flat-square&logo=telegram&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-363739?style=flat-square)
+![Status](https://img.shields.io/badge/status-complete-CCFF00?style=flat-square)
 
-## Features
+Polls live flight fare APIs for a target route, fires a Telegram alert the moment the price drops below a set threshold.
 
-- **Automated Monitoring**: Monitors a 30-day block in November 2026.
-- **Price Threshold Alert**: Alerts immediately via Telegram when direct flights drop below the specified threshold price (RM 800).
-- **Stealth Scraper Loop**: Incorporates randomized rate limits and delays (8 seconds per request, 3 hours between full scans) to run undetected by anti-scraping controls.
-- **Detailed Alert Content**: Sends price, airline, duration, flight date, and booking prompts directly to your chat window.
+Built to snipe KUL→KMG (Kuala Lumpur to Kunming) direct flights for under RM800 in November 2026.
 
-## Project Structure
+---
 
-- `flight_sniper.py`: Core price monitoring and alerting script using the `fast-flights` package.
-- `test_scrape.py`: Quick test utility to ensure scraping targets are accessible.
+## How it works
 
-## Setup & Configuration
+```python
+while True:
+    price = fetch_fare(ROUTE, TARGET_DATE)   # live API call
+    if price and price <= THRESHOLD:
+        send_telegram(f"{ROUTE} — RM{price:.0f}")
+    time.sleep(POLL_INTERVAL)                # 3h between scans
+```
 
-### Prerequisites
-- Python 3.10+
-- `requests`
-- `fast-flights` (available via pip)
+Randomized delays between requests to avoid rate limits. Runs as a persistent loop — background it with `nohup` or a cron job.
 
-### Installation
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/arifaqyl/flight-sniper.git
-   cd flight-sniper
-   ```
-2. Install dependencies:
-   ```bash
-   pip install requests fast-flights
-   ```
+---
 
-### Running the Monitor
-1. Send a text message to your Telegram bot first so it can discover your Chat ID.
-2. Launch the script:
-   ```bash
-   python flight_sniper.py
-   ```
+## Alert format
+
+When a fare drops below threshold, you get:
+
+```
+✈️ KUL → KMG — RM 749
+Airline: AirAsia
+Duration: 4h 15m
+Date: 12 Nov 2026
+Book: [link]
+```
+
+## Setup
+
+```bash
+git clone https://github.com/arifaqyl/flight-sniper
+cd flight-sniper
+pip install requests fast-flights
+```
+
+Set your config at the top of `flight_sniper.py`:
+
+```python
+ROUTE      = "KUL-KMG"
+THRESHOLD  = 800          # RM
+TARGET_DATE = "2026-11"
+CHAT_ID    = "your_telegram_chat_id"
+BOT_TOKEN  = "your_bot_token"
+POLL_INTERVAL = 10800     # 3 hours in seconds
+```
+
+## Run
+
+```bash
+python flight_sniper.py
+
+# Or background:
+nohup python flight_sniper.py &
+```
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `flight_sniper.py` | Main monitoring loop + Telegram alerts |
+| `smart_finder.py` | Extended multi-date scan |
+| `test_scrape.py` | Quick sanity check for scraping targets |
+
+## Requirements
+
+```
+Python 3.10+
+requests
+fast-flights
+```
+
+---
+
+**[arifaqyl.me](https://arifaqyl.me)** · [github.com/arifaqyl](https://github.com/arifaqyl)
