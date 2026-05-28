@@ -1,41 +1,48 @@
 # flight-sniper
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
-![Telegram](https://img.shields.io/badge/Telegram-alert-2CA5E0?style=flat-square&logo=telegram&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-history-003B57?style=flat-square&logo=sqlite&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-bot-2CA5E0?style=flat-square&logo=telegram&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-363739?style=flat-square)
-![Status](https://img.shields.io/badge/status-complete-CCFF00?style=flat-square)
+![Version](https://img.shields.io/badge/version-2.0-CCFF00?style=flat-square)
 
-Polls live flight fare APIs for a target route, fires a Telegram alert the moment the price drops below a set threshold.
+Persistent flight price monitor with SQLite history tracking, trend detection, and a Telegram bot interface.
 
-Built to snipe KUL→KMG (Kuala Lumpur to Kunming) direct flights for under RM800 in November 2026.
+Scans configured routes every 3 hours, stores every price check in a local database, and alerts you when fares hit your threshold or drop to a new historical low.
+
+---
+
+## What's new in v2
+
+- **Price history** — every checked fare is stored in `price_history.db` with timestamp
+- **Trend detection** — alerts when a price is both at threshold AND a new historical low
+- **Multi-route** — add as many `ROUTES` entries as you want in the config
+- **Bot commands** — `/check`, `/history`, `/lowest`, `/routes` via Telegram
+- **Retry logic** — exponential backoff when requests fail
+- **No hardcoded secrets** — reads `TG_BOT_TOKEN` and `TG_CHAT_ID` from env vars
 
 ---
 
 ## How it works
 
-```python
-while True:
-    price = fetch_fare(ROUTE, TARGET_DATE)   # live API call
-    if price and price <= THRESHOLD:
-        send_telegram(f"{ROUTE} — RM{price:.0f}")
-    time.sleep(POLL_INTERVAL)                # 3h between scans
+```
+[scheduled scan — every 3h]
+  for each route → for each date → fetch_prices()
+    → record to SQLite
+    → if price <= threshold → Telegram alert
+    → if new historical low → Telegram alert
+  sleep (handles /check commands during sleep window)
 ```
 
-Randomized delays between requests to avoid rate limits. Runs as a persistent loop — background it with `nohup` or a cron job.
+## Bot commands
 
----
-
-## Alert format
-
-When a fare drops below threshold, you get:
-
-```
-✈️ KUL → KMG — RM 749
-Airline: AirAsia
-Duration: 4h 15m
-Date: 12 Nov 2026
-Book: [link]
-```
+| Command | Action |
+|---|---|
+| `/check` | Scan all routes immediately |
+| `/history [route]` | Last 14 price records for a route |
+| `/lowest` | Historical low per route |
+| `/routes` | Show configured routes + thresholds |
+| `/help` | Command list |
 
 ## Setup
 
@@ -45,15 +52,26 @@ cd flight-sniper
 pip install requests fast-flights
 ```
 
-Set your config at the top of `flight_sniper.py`:
+Set env vars (or edit config dict at top of `flight_sniper.py`):
+
+```bash
+export TG_BOT_TOKEN="your_bot_token"
+export TG_CHAT_ID="your_chat_id"
+```
+
+Configure routes in `ROUTES` list:
 
 ```python
-ROUTE      = "KUL-KMG"
-THRESHOLD  = 800          # RM
-TARGET_DATE = "2026-11"
-CHAT_ID    = "your_telegram_chat_id"
-BOT_TOKEN  = "your_bot_token"
-POLL_INTERVAL = 10800     # 3 hours in seconds
+ROUTES = [
+    {
+        "label":     "KUL → KMG (Yunnan)",
+        "from":      "KUL",
+        "to":        "KMG",
+        "months":    [(2026, 11)],
+        "threshold": 800,
+        "direct":    True,
+    },
+]
 ```
 
 ## Run
@@ -61,7 +79,7 @@ POLL_INTERVAL = 10800     # 3 hours in seconds
 ```bash
 python flight_sniper.py
 
-# Or background:
+# Background:
 nohup python flight_sniper.py &
 ```
 
@@ -69,9 +87,11 @@ nohup python flight_sniper.py &
 
 | File | Purpose |
 |---|---|
-| `flight_sniper.py` | Main monitoring loop + Telegram alerts |
-| `smart_finder.py` | Extended multi-date scan |
-| `test_scrape.py` | Quick sanity check for scraping targets |
+| `flight_sniper.py` | Main daemon — scan loop + Telegram bot |
+| `smart_finder.py` | Whisper-based hype-moment finder (local video) |
+| `test_scrape.py` | Connectivity check for scraping targets |
+| `price_history.db` | SQLite — auto-created on first run |
+| `sniper.log` | Persistent run log |
 
 ## Requirements
 
