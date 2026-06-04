@@ -16,9 +16,9 @@ import requests
 from fast_flights import FlightData, get_flights
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
-# Set BOT_TOKEN and CHAT_ID as environment variables, or paste directly here.
-BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "8326380455:AAGamuS5Ys3_TTrxUCeXiLDd745BWG0jw-U")
-CHAT_ID    = os.getenv("TG_CHAT_ID", "")        # filled on first run from getUpdates
+# Configure via environment variables only.
+BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "").strip()
+CHAT_ID    = os.getenv("TG_CHAT_ID", "").strip()        # filled on first run from getUpdates
 
 ROUTES = [
     {
@@ -57,6 +57,9 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger("sniper")
+
+if not BOT_TOKEN:
+    log.warning("TG_BOT_TOKEN is not set. Telegram alerts and bot commands are disabled until it is configured.")
 
 # ── DATABASE ─────────────────────────────────────────────────────────────────
 def init_db():
