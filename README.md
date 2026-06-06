@@ -5,9 +5,10 @@
 ![Telegram](https://img.shields.io/badge/Telegram-bot-2CA5E0?style=flat-square&logo=telegram&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-363739?style=flat-square)
 
-Persistent flight price monitor with SQLite history tracking, trend detection, and Telegram alerts.
+General-purpose flight price monitor with SQLite history tracking, trend detection, optional flight API support, and Telegram alerts.
 
 The script scans configured routes, stores every observed price, and sends alerts when fares hit a target threshold or print a new historical low.
+It is not tied to one destination. Configure the routes you care about and the monitor handles the rest.
 
 ## Features
 
@@ -15,6 +16,8 @@ The script scans configured routes, stores every observed price, and sends alert
 - threshold alerts
 - new-low alerts
 - multiple route support
+- optional Amadeus Flight Offers Search provider
+- route configuration via `FLIGHT_ROUTES_JSON`
 - Telegram bot commands: `/check`, `/history`, `/lowest`, `/routes`
 - retry logic for unstable requests
 - no hardcoded secrets in the public repo
@@ -32,9 +35,22 @@ Set environment variables before running:
 ```bash
 export TG_BOT_TOKEN="your_bot_token"
 export TG_CHAT_ID="your_chat_id"
+# optional: prefer Amadeus over fast_flights
+export FLIGHT_PROVIDER="amadeus"
+export AMADEUS_CLIENT_ID="your_client_id"
+export AMADEUS_CLIENT_SECRET="your_client_secret"
 ```
 
-Then configure routes in `ROUTES` inside `flight_sniper.py`.
+Configure routes with `FLIGHT_ROUTES_JSON` or edit the sample route inside `flight_sniper.py`.
+
+Example:
+
+```bash
+export FLIGHT_ROUTES_JSON='[
+  {"label":"KUL → SIN","from":"KUL","to":"SIN","months":[[2026,7],[2026,8]],"threshold":350,"direct":false},
+  {"label":"KUL → HKG","from":"KUL","to":"HKG","months":[[2026,7]],"threshold":500,"direct":true}
+]'
+```
 
 ## Run
 
@@ -53,6 +69,7 @@ python flight_sniper.py
 ## Security
 
 - configure Telegram values through environment variables only
+- if you use Amadeus, keep client credentials in environment variables or a local secrets file
 - do not commit `.env` or local chat/token values
 - if a token was ever committed previously, rotate it in Telegram BotFather
 

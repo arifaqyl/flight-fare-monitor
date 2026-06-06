@@ -5,6 +5,7 @@ sends Telegram alerts when price hits threshold or drops to a new low.
 Supports on-demand /check and /history bot commands.
 """
 
+import json
 import os
 import sys
 import time
@@ -19,26 +20,13 @@ from fast_flights import FlightData, get_flights
 # Configure via environment variables only.
 BOT_TOKEN  = os.getenv("TG_BOT_TOKEN", "").strip()
 CHAT_ID    = os.getenv("TG_CHAT_ID", "").strip()        # filled on first run from getUpdates
+FLIGHT_PROVIDER = os.getenv("FLIGHT_PROVIDER", "auto").strip().lower()
+AMADEUS_BASE_URL = os.getenv("AMADEUS_BASE_URL", "https://test.api.amadeus.com").rstrip("/")
+AMADEUS_CLIENT_ID = os.getenv("AMADEUS_CLIENT_ID", "").strip()
+AMADEUS_CLIENT_SECRET = os.getenv("AMADEUS_CLIENT_SECRET", "").strip()
+_AMADEUS_TOKEN = {"value": None, "expires_at": 0.0}
 
-ROUTES = [
-    {
-        "label":     "KUL → KMG (Yunnan)",
-        "from":      "KUL",
-        "to":        "KMG",
-        "months":    [(2026, 11)],               # (year, month) pairs to scan
-        "threshold": 800,                        # RM — alert when price <= this
-        "direct":    True,                       # direct flights only
-    },
-    # Add more routes below:
-    # {
-    #     "label":     "KUL → SIN",
-    #     "from":      "KUL",
-    #     "to":        "SIN",
-    #     "months":    [(2026, 12)],
-    #     "threshold": 300,
-    #     "direct":    False,
-    # },
-]
+ROUTES = []
 
 DB_PATH        = "price_history.db"
 POLL_INTERVAL  = 3 * 3600    # 3 hours between full scans
@@ -60,6 +48,57 @@ log = logging.getLogger("sniper")
 
 if not BOT_TOKEN:
     log.warning("TG_BOT_TOKEN is not set. Telegram alerts and bot commands are disabled until it is configured.")
+if FLIGHT_PROVIDER == "amadeus" and not (AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET):
+    log.warning("FLIGHT_PROVIDER=amadeus but Amadeus credentials are missing; the monitor will fall back to fast_flights.")
+
+def _load_routes():
+    raw = os.getenv("FLIGHT_ROUTES_JSON", "").strip()
+    if raw:
+        try:
+            routes = json.loads(raw)
+            if isinstance(routes, list) and routes:
+                return [_normalize_route(route) for route in routes]
+        except json.JSONDecodeError as exc:
+            log.warning(f"FLIGHT_ROUTES_JSON could not be parsed: {exc}")
+
+    next_month = (datetime.now().replace(day=1) + timedelta(days=32)).replace(day=1)
+    return [
+        _normalize_route(
+            {
+                "label": "KUL → SIN (sample)",
+                "from": "KUL",
+                "to": "SIN",
+                "months": [(next_month.year, next_month.month)],
+                "threshold": 300,
+                "direct": False,
+            }
+        )
+    ]
+
+
+def _normalize_route(route):
+    year_months = route.get("months") or []
+    months = []
+    for item in year_months:
+        try:
+            year, month = item
+            months.append((int(year), int(month)))
+        except Exception:
+            continue
+    if not months:
+        next_month = (datetime.now().replace(day=1) + timedelta(days=32)).replace(day=1)
+        months = [(next_month.year, next_month.month)]
+    return {
+        "label": route.get("label") or f"{route.get('from', 'XXX')} → {route.get('to', 'YYY')}",
+        "from": str(route.get("from", "")).strip().upper(),
+        "to": str(route.get("to", "")).strip().upper(),
+        "months": months,
+        "threshold": int(route.get("threshold", 0)),
+        "direct": bool(route.get("direct", False)),
+    }
+
+
+ROUTES = _load_routes()
 
 # ── DATABASE ─────────────────────────────────────────────────────────────────
 def init_db():
@@ -150,6 +189,36 @@ def resolve_chat_id():
 # ── FETCH PRICES ─────────────────────────────────────────────────────────────
 def fetch_prices(from_airport, to_airport, date_str, direct_only=True):
     """Fetch flight prices for a single date. Returns list of dicts."""
+    providers = _provider_order()
+    last_error = None
+    for provider in providers:
+        try:
+            if provider == "amadeus":
+                results = fetch_prices_amadeus(from_airport, to_airport, date_str, direct_only=direct_only)
+            else:
+                results = fetch_prices_fast_flights(from_airport, to_airport, date_str, direct_only=direct_only)
+            if results is not None:
+                return results
+        except Exception as exc:
+            last_error = exc
+            log.warning(f"{provider} fetch failed for {from_airport}→{to_airport} {date_str}: {exc}")
+    if last_error:
+        log.error(f"All providers failed for {from_airport}→{to_airport} {date_str}: {last_error}")
+    return []
+
+
+def _provider_order():
+    if FLIGHT_PROVIDER == "amadeus":
+        return ["amadeus", "fast_flights"]
+    if FLIGHT_PROVIDER == "fast_flights":
+        return ["fast_flights"]
+    if AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET:
+        return ["amadeus", "fast_flights"]
+    return ["fast_flights"]
+
+
+def fetch_prices_fast_flights(from_airport, to_airport, date_str, direct_only=True):
+    """Fetch flight prices for a single date with fast_flights. Returns list of dicts."""
     for attempt in range(MAX_RETRIES):
         try:
             res = get_flights(
@@ -181,6 +250,98 @@ def fetch_prices(from_airport, to_airport, date_str, direct_only=True):
             else:
                 log.error(f"All retries failed for {from_airport}→{to_airport} {date_str}: {e}")
                 return []
+
+
+def fetch_prices_amadeus(from_airport, to_airport, date_str, direct_only=True):
+    if not (AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET):
+        return None
+
+    token = _amadeus_access_token()
+    if not token:
+        return None
+
+    params = {
+        "originLocationCode": from_airport,
+        "destinationLocationCode": to_airport,
+        "departureDate": date_str,
+        "adults": 1,
+        "currencyCode": "MYR",
+        "max": 20,
+        "nonStop": str(bool(direct_only)).lower(),
+    }
+    response = requests.get(
+        f"{AMADEUS_BASE_URL}/v2/shopping/flight-offers",
+        params=params,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        timeout=20,
+    )
+    if response.status_code in {401, 403}:
+        _AMADEUS_TOKEN["value"] = None
+        _AMADEUS_TOKEN["expires_at"] = 0.0
+        return None
+    response.raise_for_status()
+    payload = response.json()
+    offers = payload.get("data") or []
+    results = []
+    for offer in offers:
+        itinerary = (offer.get("itineraries") or [{}])[0]
+        segments = itinerary.get("segments") or []
+        stops = max(len(segments) - 1, 0)
+        if direct_only and stops != 0:
+            continue
+        price_obj = offer.get("price") or {}
+        price_raw = price_obj.get("grandTotal") or price_obj.get("total")
+        try:
+            price = int(float(price_raw))
+        except (TypeError, ValueError):
+            continue
+        airline = _amadeus_airline_name(offer) or "Unknown"
+        duration = itinerary.get("duration", "")
+        results.append({
+            "airline": airline,
+            "price": price,
+            "duration": duration,
+            "stops": stops,
+        })
+    return results
+
+
+def _amadeus_access_token():
+    now = time.time()
+    if _AMADEUS_TOKEN["value"] and _AMADEUS_TOKEN["expires_at"] > now + 60:
+        return _AMADEUS_TOKEN["value"]
+
+    response = requests.post(
+        f"{AMADEUS_BASE_URL}/v1/security/oauth2/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": AMADEUS_CLIENT_ID,
+            "client_secret": AMADEUS_CLIENT_SECRET,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    token = payload.get("access_token")
+    expires_in = int(payload.get("expires_in", 1800))
+    if not token:
+        return None
+    _AMADEUS_TOKEN["value"] = token
+    _AMADEUS_TOKEN["expires_at"] = now + expires_in
+    return token
+
+
+def _amadeus_airline_name(offer):
+    codes = offer.get("validatingAirlineCodes") or []
+    if codes:
+        return codes[0]
+    segments = ((offer.get("itineraries") or [{}])[0].get("segments") or [])
+    for segment in segments:
+        carrier = segment.get("carrierCode")
+        if carrier:
+            return carrier
+    return ""
 
 # ── SCAN ─────────────────────────────────────────────────────────────────────
 def scan_route(conn, route, chat_id):
