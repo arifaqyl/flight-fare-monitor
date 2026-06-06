@@ -1,4 +1,4 @@
-# flight-sniper
+# flight-fare-monitor
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=flat-square&logo=python&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite-history-003B57?style=flat-square&logo=sqlite&logoColor=white)
@@ -22,8 +22,8 @@ The script scans configured routes, stores every observed price, and sends alert
 ## Setup
 
 ```bash
-git clone https://github.com/arifaqyl/flight-sniper
-cd flight-sniper
+git clone https://github.com/arifaqyl/flight-fare-monitor
+cd flight-fare-monitor
 pip install requests fast-flights
 ```
 
