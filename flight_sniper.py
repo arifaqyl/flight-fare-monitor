@@ -1,5 +1,5 @@
 """
-flight-sniper v2
+flight-fare-monitor v2
 Monitors flight prices for configured routes, stores history in SQLite,
 sends Telegram alerts when price hits threshold or drops to a new low.
 Supports on-demand /check and /history bot commands.
@@ -275,7 +275,7 @@ def handle_commands(conn, chat_id, last_update_id):
 
         elif text.startswith("/help") or text.startswith("/start"):
             tg_send(chat_id,
-                "<b>flight-sniper commands</b>\n"
+                "<b>flight-fare-monitor commands</b>\n"
                 "/check — scan all routes now\n"
                 "/history [route] — last 14 price records\n"
                 "/lowest — historical low per route\n"
@@ -288,14 +288,14 @@ def handle_commands(conn, chat_id, last_update_id):
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 def main():
     conn = init_db()
-    log.info("flight-sniper v2 starting")
+    log.info("flight-fare-monitor v2 starting")
 
     chat_id = CHAT_ID
     if not chat_id:
         chat_id = resolve_chat_id()
 
     tg_send(chat_id,
-        "<b>flight-sniper v2 active</b>\n"
+        "<b>flight-fare-monitor v2 active</b>\n"
         + "\n".join(
             f"{r['label']} — alert at ≤ RM {r['threshold']}"
             for r in ROUTES
